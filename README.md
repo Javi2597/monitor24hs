@@ -42,6 +42,19 @@ Creado por **Javi Bellido** — proyecto de código abierto bajo licencia MIT.
 
 ---
 
+## 📸 Screenshots
+
+### Panel de métricas
+![Métricas](assets/screenshot-metricas.png)
+
+### Historial 24hs
+![Historial](assets/screenshot-historial.png)
+
+### Monitor de conexiones
+![Conexiones](assets/screenshot-conexiones.png)
+
+---
+
 ## Requisitos
 
 - Windows 10 / 11
