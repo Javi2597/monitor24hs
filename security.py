@@ -300,13 +300,14 @@ def check_sig(exe: str) -> dict:
     except Exception:
         pass
     try:
-        esc = exe.replace("'", "''")
-        ps  = (f"$s=(Get-AuthenticodeSignature '{esc}');"
-               "$s.Status.ToString()+'|'+"
-               "($s.SignerCertificate.Subject -replace '.*CN=([^,]+).*','$1')")
+        # Ruta pasada por stdin para evitar inyección en el comando PowerShell
+        ps = ("$exe = $input | Out-String -NoNewline;"
+              "$s = Get-AuthenticodeSignature $exe;"
+              "$s.Status.ToString() + '|' +"
+              "($s.SignerCertificate.Subject -replace '.*CN=([^,]+).*','$1')")
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=10,
+            input=exe, capture_output=True, text=True, timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW)
         out = r.stdout.strip()
         if "|" in out:

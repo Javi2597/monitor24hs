@@ -1,6 +1,8 @@
 """Network monitoring and IP intelligence — blocking I/O for ThreadPoolExecutor."""
+import ipaddress
 import json
 import socket
+import ssl
 import time
 import urllib.request
 import urllib.error
@@ -8,6 +10,8 @@ import urllib.error
 import psutil
 
 import utils
+
+_SSL_CTX = ssl.create_default_context()
 
 
 def collect_conns(session_bytes: dict, prev_io: dict,
@@ -62,6 +66,10 @@ def collect_conns(session_bytes: dict, prev_io: dict,
 def resolve_ip(ip: str) -> dict:
     res = {"host": ip, "org": "", "country": "", "lat": None, "lon": None}
     try:
+        ipaddress.ip_address(ip)  # valida que sea IP legítima antes de la petición
+    except ValueError:
+        return res
+    try:
         res["host"] = socket.gethostbyaddr(ip)[0]
     except Exception:
         pass
@@ -69,7 +77,7 @@ def resolve_ip(ip: str) -> dict:
         req = urllib.request.Request(
             f"https://ipinfo.io/{ip}/json",
             headers={"User-Agent": "system-monitor/1.0"})
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as r:
             d = json.loads(r.read())
         res["org"]     = d.get("org", "")
         res["country"] = d.get("country", "")
@@ -88,7 +96,7 @@ def vt_lookup(kind: str, val: str, api_key: str) -> dict:
     req = urllib.request.Request(
         f"https://www.virustotal.com/api/v3/{ep}/{val}",
         headers={"x-apikey": api_key, "User-Agent": "system-monitor/1.0"})
-    with urllib.request.urlopen(req, timeout=12) as r:
+    with urllib.request.urlopen(req, timeout=12, context=_SSL_CTX) as r:
         d = json.loads(r.read())
     s = d["data"]["attributes"]["last_analysis_stats"]
     return {k: s.get(k, 0) for k in ("malicious", "suspicious", "harmless", "undetected")}

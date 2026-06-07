@@ -8,6 +8,8 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, filedialog
 import ctypes
 import ctypes.wintypes
+import html as _html
+import re
 import time
 import sys
 import subprocess
@@ -939,20 +941,18 @@ class Monitor:
             self._update_fw_btn()
 
     def _apply_fw_block(self, proc_name: str, pid: int) -> tuple:
-        rule = f"SysMon_{proc_name}_{int(time.time())}"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", proc_name)
+        rule = f"SysMon_{safe_name}_{int(time.time())}"
         exe  = ""
         try:
             exe = psutil.Process(pid).exe() if pid else ""
         except Exception:
             pass
-        cmd = ["netsh","advfirewall","firewall","add","rule",
-               f"name={rule}", "dir=out", "action=block", "enable=yes",
-               "profile=any"]
-        if exe:
-            cmd.append(f"program={exe}")
-        else:
-            # Sin exe conocido: bloquear por nombre de programa si es posible
+        if not exe:
             return False, "No se pudo obtener ruta del ejecutable"
+        cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
+               f"name={rule}", "dir=out", "action=block", "enable=yes",
+               "profile=any", f"program={exe}"]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
                                creationflags=subprocess.CREATE_NO_WINDOW)
@@ -962,14 +962,15 @@ class Monitor:
                     "time": time.strftime("%H:%M:%S")}
                 return True, rule
             else:
-                return False, r.stderr.strip()
+                return False, "Error al crear regla de firewall"
         except Exception as e:
             return False, str(e)
 
     def _remove_fw_block(self, rule: str):
         try:
             subprocess.run(
-                ["netsh","advfirewall","firewall","delete","rule",f"name={rule}"],
+                ["netsh", "advfirewall", "firewall", "delete", "rule",
+                 f"name={rule}"],
                 capture_output=True, timeout=8,
                 creationflags=subprocess.CREATE_NO_WINDOW)
         except Exception:
@@ -1339,9 +1340,9 @@ class Monitor:
         try:
             script = os.path.abspath(__file__)
             subprocess.run([
-                "schtasks","/create","/tn",_TASK_NAME,
+                "schtasks", "/create", "/tn", _TASK_NAME,
                 "/tr", f'"{sys.executable}" "{script}"',
-                "/sc","onlogon","/rl","HIGHEST","/f"
+                "/sc", "onlogon", "/f"
             ], capture_output=True, timeout=10,
                creationflags=subprocess.CREATE_NO_WINDOW)
         except Exception:
@@ -1915,6 +1916,7 @@ td{padding:5px 10px;border-bottom:1px solid #333}
 tr.susp td{color:#ef4444}.ok{color:#4ade80}.warn{color:#facc15}.crit{color:#ef4444}
 .dim{color:#888}.badge{display:inline-block;padding:2px 8px;border-radius:3px;
 font-size:11px;background:#252526}"""
+        h = _html.escape  # alias para escapar todos los valores en el HTML
         rows_html = ""
         for r in self._last_rows:
             cls = "susp" if (r.get("suspicious") or r.get("port_bad")) else ""
@@ -1924,29 +1926,30 @@ font-size:11px;background:#252526}"""
             if vt and not vt.get("pending") and "error" not in vt:
                 m = vt.get("malicious",0)
                 vt_s = f'<span class="{"crit" if m else "ok"}">{m} mal</span>'
-            rows_html += (f'<tr class="{cls}"><td>{r["proc"]}</td><td>{r["pid"]}</td>'
-                          f'<td>{r["ip"]}</td><td>{r["port"]}</td><td>{r["state"]}</td>'
-                          f'<td>{info.get("country","")}</td><td>{info.get("org","")[:30]}</td>'
+            rows_html += (f'<tr class="{cls}"><td>{h(r["proc"])}</td><td>{h(str(r["pid"]))}</td>'
+                          f'<td>{h(r["ip"])}</td><td>{h(str(r["port"]))}</td><td>{h(r["state"])}</td>'
+                          f'<td>{h(info.get("country",""))}</td><td>{h(info.get("org","")[:30])}</td>'
                           f'<td>{vt_s}</td></tr>\n')
         fw_html = ""
         for rule, info in self._fw_blocks.items():
-            fw_html += f'<tr><td>{info["proc"]}</td><td>{info["exe"][:60]}</td><td>{info["time"]}</td></tr>\n'
+            fw_html += (f'<tr><td>{h(info["proc"])}</td><td>{h(info["exe"][:60])}</td>'
+                        f'<td>{h(info["time"])}</td></tr>\n')
         evtlog_html = ""
         label_map = {"4625":"Logon fallido","4720":"Usuario creado","7045":"Servicio instalado",
                      "1102":"Log borrado","4719":"Auditoría cambiada"}
         for e in self._evtlog_events[:30]:
-            lbl = label_map.get(e["id"],f"ID {e['id']}")
+            lbl = label_map.get(e["id"], f"ID {h(e['id'])}")
             cls = "crit" if e["id"] in {"7045","1102","4720","4719"} else "warn"
-            evtlog_html += (f'<tr><td class="{cls}">{e["id"]}</td>'
+            evtlog_html += (f'<tr><td class="{cls}">{h(e["id"])}</td>'
                             f'<td class="{cls}">{lbl}</td>'
-                            f'<td>{e["ts"]}</td><td>{e["msg"][:80]}</td></tr>\n')
+                            f'<td>{h(e["ts"])}</td><td>{h(e["msg"][:80])}</td></tr>\n')
         history_html = ""
         try:
             hist_rows = self._db.load_recent_connections()
             for ts2,proc,ip,port,state,country in hist_rows:
-                history_html += (f'<tr class="susp"><td>{ts2}</td><td>{proc}</td>'
-                                 f'<td>{ip}</td><td>{port}</td><td>{state}</td>'
-                                 f'<td>{country or ""}</td></tr>\n')
+                history_html += (f'<tr class="susp"><td>{h(ts2)}</td><td>{h(proc)}</td>'
+                                 f'<td>{h(ip)}</td><td>{h(str(port))}</td><td>{h(state)}</td>'
+                                 f'<td>{h(country or "")}</td></tr>\n')
         except Exception: pass
         gpu_s = "N/D"
         if self._gpu_info:
