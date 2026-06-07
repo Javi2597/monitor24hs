@@ -625,8 +625,8 @@ class Monitor:
             self._check_resource_alerts(cpu, mem.percent, dp)
             self._update_top_procs()
             self._update_status_header()
-        except Exception as e:
-            self._ts_metrics.config(text=f"Error: {e}", fg=RED)
+        except Exception:
+            self._ts_metrics.config(text="Error al obtener métricas", fg=RED)
         self.root.after(REFRESH_METRICS, self._tick_metrics)
 
     def _check_resource_alerts(self, cpu: float, ram: float, disk: float = 0.0):
@@ -879,8 +879,8 @@ class Monitor:
         except (psutil.AccessDenied, PermissionError):
             self._ts_conns.config(
                 text="Sin permisos — ejecuta como Administrador", fg=RED)
-        except Exception as e:
-            self._ts_conns.config(text=f"Error: {e}", fg=RED)
+        except Exception:
+            self._ts_conns.config(text="Error al leer conexiones", fg=RED)
         self.root.after(REFRESH_CONNS, self._tick_conns)
 
     def _render_conns(self, rows: list, susp_count: int):
@@ -1258,14 +1258,22 @@ class Monitor:
             tk.Label(win, text=text, font=("Segoe UI",9,"bold"),
                      bg=BG, fg=ACCENT).pack(anchor="w", padx=20, pady=(4,0))
 
-        def _row(parent, label, var, width=8):
+        def _row(parent, label, var, width=8, secret=False):
             f = tk.Frame(parent, bg=BG)
             f.pack(fill="x", padx=24, pady=4)
             tk.Label(f, text=label, font=("Segoe UI",9),
                      bg=BG, fg=FG, width=22, anchor="w").pack(side="left")
-            tk.Entry(f, textvariable=var, font=("Consolas",9),
-                     bg=BG2, fg=FG, insertbackground=FG,
-                     relief="flat", width=width).pack(side="left")
+            entry = tk.Entry(f, textvariable=var, font=("Consolas",9),
+                             bg=BG2, fg=FG, insertbackground=FG,
+                             relief="flat", width=width,
+                             show="*" if secret else "")
+            entry.pack(side="left")
+            if secret:
+                def _toggle(e=entry):
+                    e.config(show="" if e.cget("show") == "*" else "*")
+                tk.Button(f, text="👁", font=("Segoe UI",8), bg=BG2, fg=DIM,
+                          relief="flat", bd=0, cursor="hand2",
+                          command=_toggle).pack(side="left", padx=(4,0))
 
         # Umbrales
         _sep("Alertas de recursos")
@@ -1279,7 +1287,7 @@ class Monitor:
         # API VirusTotal
         _sep("VirusTotal")
         v_vt = tk.StringVar(value=self._cfg.get("vt_api_key",""))
-        _row(win, "API Key:", v_vt, width=36)
+        _row(win, "API Key:", v_vt, width=36, secret=True)
 
         # Auto-inicio
         _sep("Sistema")
@@ -1292,12 +1300,21 @@ class Monitor:
                        activebackground=BG, relief="flat").pack(side="left")
 
         def _save():
-            try:
-                self._cpu_thresh  = max(1.0, min(100.0, float(v_cpu.get())))
-                self._ram_thresh  = max(1.0, min(100.0, float(v_ram.get())))
-                self._disk_thresh = max(1.0, min(100.0, float(v_disk.get())))
-            except ValueError:
-                pass
+            errors = []
+            new_vals = {}
+            for name, var, attr in [("CPU",   v_cpu,  "_cpu_thresh"),
+                                     ("RAM",   v_ram,  "_ram_thresh"),
+                                     ("Disco", v_disk, "_disk_thresh")]:
+                try:
+                    new_vals[attr] = max(1.0, min(100.0, float(var.get())))
+                except ValueError:
+                    errors.append(f"Umbral {name}: valor inválido '{var.get()}'")
+            if errors:
+                messagebox.showerror("Config — Error",
+                                     "\n".join(errors), parent=win)
+                return
+            for attr, val in new_vals.items():
+                setattr(self, attr, val)
             self._cfg["cpu_thresh"]  = self._cpu_thresh
             self._cfg["ram_thresh"]  = self._ram_thresh
             self._cfg["disk_thresh"] = self._disk_thresh
@@ -1462,13 +1479,15 @@ class Monitor:
     # ── VirusTotal ──────────────────────────────────────────────────────────
 
     def _prompt_vt_key(self):
+        # No pasar initialvalue para no mostrar la clave en texto plano
+        has_key = bool(self._cfg.get("vt_api_key", "").strip())
+        prompt = ("Ingresá tu API key de VirusTotal:"
+                  + ("\n(ya existe una clave guardada — deja vacío para mantenerla)" if has_key else ""))
         key = simpledialog.askstring(
-            "VirusTotal API Key",
-            "Ingresá tu API key de VirusTotal:",
-            parent=self.root,
-            initialvalue=self._cfg.get("vt_api_key",""))
+            "VirusTotal API Key", prompt, parent=self.root, show="*")
         if key is None: return
         key = key.strip()
+        if not key and has_key: return  # vacío = no cambiar
         self._cfg["vt_api_key"] = key; _save_cfg(self._cfg)
         self._vt_key_btn.config(
             text="API VT "+("✓" if key else "✗"),
@@ -1784,7 +1803,7 @@ class Monitor:
                 self._hosts_hash = h
                 if self._tray:
                     self._tray.notify("⚠ Hosts file modificado",
-                                      _HOSTS_PATH, warning=True)
+                                      utils.HOSTS_PATH, warning=True)
                 self._susp_lbl.config(text="  ⚠ hosts file cambiado!", fg=RED)
         except Exception:
             pass
