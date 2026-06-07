@@ -2,6 +2,8 @@
 
 Monitor de seguridad en tiempo real para Windows. Detecta conexiones sospechosas, analiza procesos, consulta VirusTotal y permite bloquear amenazas directamente desde la interfaz.
 
+Creado por **Javi Bellido** — proyecto de código abierto bajo licencia MIT.
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![Windows](https://img.shields.io/badge/Windows-10%2F11-blue) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
@@ -9,7 +11,7 @@ Monitor de seguridad en tiempo real para Windows. Detecta conexiones sospechosas
 ## Funcionalidades
 
 ### Métricas del sistema
-- CPU, RAM, Disco, temperatura CPU y GPU en tiempo real
+- CPU, RAM, Disco, **temperatura de zona térmica** y GPU en tiempo real
 - Gráfico de red en vivo (últimos 2 minutos)
 - Top 5 procesos por uso de CPU
 
@@ -113,6 +115,7 @@ Todo el I/O pesado se ejecuta en un `ThreadPoolExecutor` y los resultados se des
 
 ## Advertencias
 
+- **Temperatura mostrada**: el valor de temperatura corresponde a la **zona térmica del sistema** (`Win32_PerfFormattedData_Counters_ThermalZoneInformation`), no a los núcleos individuales del procesador. Esta fuente no requiere permisos de Administrador. Para obtener temperaturas por núcleo se necesitaría software externo como [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) ejecutándose en segundo plano.
 - El programa crea reglas de salida en el **Firewall de Windows** cuando se usa el botón "Bloquear FW". Estas reglas se pueden ver y eliminar desde el gestor de firewall integrado en la app.
 - La detección de DLL injection escanea los mapas de memoria de procesos activos; puede no tener acceso a procesos de sistema sin permisos elevados.
 - El límite de la API gratuita de VirusTotal es de **500 consultas/día** (el programa aplica un límite interno de 75/día para no agotarla).
@@ -138,6 +141,12 @@ El proyecto fue sometido a una auditoría de seguridad interna. Los principales 
 
 ---
 
+## Autor
+
+**Javi Bellido** — [github.com/Javi2597](https://github.com/Javi2597)
+
+---
+
 ## Licencia
 
-MIT
+MIT — código abierto, libre para usar, modificar y distribuir.
