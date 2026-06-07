@@ -102,5 +102,11 @@ def save_cfg(cfg: dict):
     try:
         with open(CFG_PATH, "w") as f:
             json.dump(cfg, f, indent=2)
+        # Restringir lectura solo al usuario actual (evita que otros procesos lean la API key)
+        import subprocess as _sp
+        _sp.run(
+            ["icacls", CFG_PATH, "/inheritance:r",
+             "/grant:r", f"{os.environ.get('USERNAME', os.getlogin())}:F"],
+            capture_output=True, timeout=5)
     except Exception:
         pass

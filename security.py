@@ -7,6 +7,17 @@ import psutil
 
 import utils
 
+# Rutas conocidas para herramientas externas — evita binary hijacking via PATH
+_SIGCHECK_CANDIDATES = [
+    r"C:\Tools\sigcheck.exe",
+    r"C:\Tools\sigcheck64.exe",
+    r"C:\Program Files\Sysinternals\sigcheck.exe",
+    r"C:\Program Files\Sysinternals\sigcheck64.exe",
+]
+_SIGCHECK_PATH = next((p for p in _SIGCHECK_CANDIDATES if os.path.isfile(p)), None)
+
+_NVIDIA_SMI_PATH = r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+
 try:
     import winreg as _winreg
     WINREG = True
@@ -75,10 +86,11 @@ def cpu_temp() -> float:
 # ── GPU ──────────────────────────────────────────────────────────────────────
 
 def gpu_info() -> dict:
-    # NVIDIA via nvidia-smi
+    # NVIDIA via nvidia-smi — usa ruta absoluta si existe, cae a PATH como fallback
+    _smi = _NVIDIA_SMI_PATH if os.path.isfile(_NVIDIA_SMI_PATH) else "nvidia-smi"
     try:
         r = subprocess.run(
-            ["nvidia-smi",
+            [_smi,
              "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
@@ -215,8 +227,11 @@ def hash_hosts() -> str:
 # ── DNS cache scan ────────────────────────────────────────────────────────────
 
 def scan_dns() -> list:
-    _BAD_TLD  = {".ru", ".cn", ".tk", ".xyz", ".top", ".pw", ".cc", ".su"}
-    _KEYWORDS = {"payload", "c2", "shell", "bot", "rat", "malware", "exploit", "cmd"}
+    import re as _re
+    _BAD_TLD = {".tk", ".xyz", ".top", ".pw", ".su"}
+    # Keywords como segmentos completos del dominio (entre puntos), no subcadenas
+    _KW_RE = _re.compile(
+        r'(?:^|\.)(?:payload|c2server|shellcode|botnet|ratkit|malware-|exploit-kit)(?:\.|$)')
     suspicious = []
     try:
         r = subprocess.run(
@@ -226,8 +241,10 @@ def scan_dns() -> list:
         for line in r.stdout.splitlines():
             if "Nombre de registro" in line or "Record Name" in line:
                 domain = line.split(":", 1)[-1].strip().lower().rstrip(".")
+                if not domain or " " in domain:
+                    continue
                 bad = (any(domain.endswith(t) for t in _BAD_TLD)
-                       or any(k in domain for k in _KEYWORDS))
+                       or _KW_RE.search(domain) is not None)
                 if bad:
                     suspicious.append(domain)
     except Exception:
@@ -281,26 +298,26 @@ def compute_hash(pid: int) -> str:
 # ── Digital signature ─────────────────────────────────────────────────────────
 
 def check_sig(exe: str) -> dict:
+    # Intento 1: sigcheck de Sysinternals (solo si existe en ruta conocida)
+    if _SIGCHECK_PATH:
+        try:
+            r = subprocess.run(
+                [_SIGCHECK_PATH, "-nobanner", "-accepteula", "-q", exe],
+                capture_output=True, text=True, timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            out = r.stdout + r.stderr
+            if "Verified:" in out:
+                signed = "Unsigned" not in out
+                pub = ""
+                for line in out.splitlines():
+                    if line.strip().startswith("Publisher:"):
+                        pub = line.split(":", 1)[1].strip()
+                        break
+                return {"signed": signed, "publisher": pub}
+        except Exception:
+            pass
+    # Intento 2: Get-AuthenticodeSignature vía PowerShell — ruta pasada por stdin
     try:
-        r = subprocess.run(
-            ["sigcheck.exe", "-nobanner", "-accepteula", "-q", exe],
-            capture_output=True, text=True, timeout=8,
-            creationflags=subprocess.CREATE_NO_WINDOW)
-        out = r.stdout + r.stderr
-        if "Verified:" in out:
-            signed = "Unsigned" not in out
-            pub = ""
-            for line in out.splitlines():
-                if line.strip().startswith("Publisher:"):
-                    pub = line.split(":", 1)[1].strip()
-                    break
-            return {"signed": signed, "publisher": pub}
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-    try:
-        # Ruta pasada por stdin para evitar inyección en el comando PowerShell
         ps = ("$exe = $input | Out-String -NoNewline;"
               "$s = Get-AuthenticodeSignature $exe;"
               "$s.Status.ToString() + '|' +"
