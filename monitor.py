@@ -1,37 +1,24 @@
 """
-System Monitor — Windows  v4.0
+System Monitor — Windows  v5.0
 Arquitectura: todo en el hilo principal via root.after().
 I/O pesado en ThreadPoolExecutor; resultados via root.after(0, cb).
-v4: bloqueo firewall · privilegios SYSTEM/Admin · tareas programadas
-    · registro Run · temp CPU · GPU · historial gráfico 24h
-    · umbrales configurables · always-on-top · auto-inicio Windows
+Módulos: utils · db · network · security
 """
 import tkinter as tk
 from tkinter import messagebox, simpledialog, filedialog
 import time
-import ipaddress
-import ctypes
-import ctypes.wintypes
-import winsound
-import psutil
-import socket
-import json
-import os
 import sys
-import sqlite3
 import subprocess
-import hashlib
-import csv
+import os
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-import urllib.request
-import urllib.error
+import winsound
+import psutil
 
-try:
-    import winreg
-    _WINREG = True
-except ImportError:
-    _WINREG = False
+import utils
+import db as dbmod
+import network
+import security
 
 # ─── Intervalos ────────────────────────────────────────────────────────────
 REFRESH_METRICS  = 2_000
@@ -48,14 +35,6 @@ SVC_INTERVAL     = 60_000
 HOSTS_INTERVAL   = 30_000
 DNS_INTERVAL     = 45_000
 
-_HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
-_SAFE_DLL_DIRS = (
-    "c:\\windows\\system32", "c:\\windows\\syswow64",
-    "c:\\windows\\winsxs",   "c:\\program files",
-    "c:\\program files (x86)", "c:\\windows\\",
-)
-_EVTLOG_IDS = {4625, 4720, 4728, 4732, 7045, 1102, 4719}
-
 # ─── Paleta ────────────────────────────────────────────────────────────────
 BG       = "#1e1e1e"
 FG       = "#ffffff"
@@ -68,19 +47,6 @@ YELLOW   = "#facc15"
 ORANGE   = "#f97316"
 PURPLE   = "#a78bfa"
 
-# ─── Puertos maliciosos conocidos ──────────────────────────────────────────
-SUSPICIOUS_PORTS = frozenset({
-    4444, 1337, 31337, 8888, 9001, 9050,
-    1234, 5555, 6666, 7777, 6667, 6668,
-})
-
-# ─── Whitelist base ────────────────────────────────────────────────────────
-WHITELIST = frozenset({
-    "chrome.exe", "firefox.exe", "msedge.exe", "svchost.exe",
-    "explorer.exe", "OneDrive.exe", "discord.exe", "steam.exe",
-    "pythonw.exe", "Code.exe",
-})
-
 # ─── Columnas de la tabla de conexiones ────────────────────────────────────
 _C = {"proc": 17, "pid": 7, "ip": 18, "port": 7, "state": 14, "mb": 10}
 _HEADER = (f"{'Proceso':<{_C['proc']}}{' PID':<{_C['pid']}}"
@@ -88,87 +54,16 @@ _HEADER = (f"{'Proceso':<{_C['proc']}}{' PID':<{_C['pid']}}"
            f"{'Estado':<{_C['state']}}MB Env.")
 _SEP = "-" * sum(_C.values())
 
-_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="mon_bg")
-
-_BASE     = os.path.dirname(os.path.abspath(__file__))
-_CFG_PATH = os.path.join(_BASE, "config.json")
-_DB_PATH  = os.path.join(_BASE, "monitor_history.db")
-
-_TASK_NAME = "SystemMonitorApp"   # nombre en el Task Scheduler
+_executor  = ThreadPoolExecutor(max_workers=6, thread_name_prefix="mon_bg")
+_TASK_NAME = "SystemMonitorApp"
 
 
-# ─── Helpers globales ──────────────────────────────────────────────────────
-
-def _is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def _clipboard_set(text: str) -> bool:
-    try:
-        CF = 13; GM = 0x0002
-        k32, u32 = ctypes.windll.kernel32, ctypes.windll.user32
-        k32.GlobalAlloc.restype  = ctypes.c_void_p
-        k32.GlobalAlloc.argtypes = [ctypes.wintypes.UINT, ctypes.c_size_t]
-        k32.GlobalLock.restype   = ctypes.c_void_p
-        k32.GlobalLock.argtypes  = [ctypes.c_void_p]
-        k32.GlobalUnlock.argtypes = k32.GlobalFree.argtypes = [ctypes.c_void_p]
-        u32.OpenClipboard.argtypes    = [ctypes.c_void_p]
-        u32.SetClipboardData.restype  = ctypes.c_void_p
-        u32.SetClipboardData.argtypes = [ctypes.wintypes.UINT, ctypes.c_void_p]
-        enc = (text + "\0").encode("utf-16-le")
-        h = k32.GlobalAlloc(GM, len(enc))
-        if not h: return False
-        p = k32.GlobalLock(h)
-        if not p: k32.GlobalFree(h); return False
-        ctypes.memmove(p, enc, len(enc))
-        k32.GlobalUnlock(h)
-        if not u32.OpenClipboard(None): k32.GlobalFree(h); return False
-        u32.EmptyClipboard(); u32.SetClipboardData(CF, h); u32.CloseClipboard()
-        return True
-    except Exception:
-        return False
-
-
-def _fmt_bytes(bps: float) -> str:
-    if bps < 1_024:     return f"{bps:.0f} B"
-    if bps < 1_048_576: return f"{bps/1_024:.1f} KB"
-    return f"{bps/1_048_576:.2f} MB"
-
-
-def _is_external(ip: str) -> bool:
-    try:
-        a = ipaddress.ip_address(ip)
-        return not (a.is_loopback or a.is_private
-                    or a.is_link_local or a.is_unspecified)
-    except ValueError:
-        return False
-
-
-def _proc_name(pid: int) -> str:
-    try:   return psutil.Process(pid).name()
-    except: return "N/A"
-
-
-def _proc_io_other(pid: int) -> int:
-    try:   return getattr(psutil.Process(pid).io_counters(), "other_bytes", 0)
-    except: return 0
-
-
-def _load_cfg() -> dict:
-    try:
-        with open(_CFG_PATH) as f: return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_cfg(cfg: dict):
-    try:
-        with open(_CFG_PATH, "w") as f: json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
+# ─── Aliases locales para no reescribir cada llamada ──────────────────────
+_fmt_bytes    = utils.fmt_bytes
+_is_admin     = utils.is_admin
+_clipboard_set = utils.clipboard_set
+_load_cfg     = utils.load_cfg
+_save_cfg     = utils.save_cfg
 
 
 # ─── Bandeja del sistema ────────────────────────────────────────────────────
@@ -385,8 +280,7 @@ class Monitor:
         self._tooltip_win = None
 
         # SQLite
-        self._db = None
-        self._init_db()
+        self._db = dbmod.HistoryDB(utils.DB_PATH)
 
         # Tray
         self._tray: _SysTray | None = None
@@ -413,34 +307,6 @@ class Monitor:
 
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
-    # ── Init ────────────────────────────────────────────────────────────────
-
-    def _init_db(self):
-        try:
-            self._db = sqlite3.connect(_DB_PATH, check_same_thread=False)
-            self._db.execute("""
-                CREATE TABLE IF NOT EXISTS connections (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT, proc TEXT, pid INTEGER,
-                    ip TEXT, port INTEGER, state TEXT, mb REAL,
-                    suspicious INTEGER, country TEXT, org TEXT
-                )""")
-            self._db.execute("""
-                CREATE TABLE IF NOT EXISTS metrics_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT, cpu REAL, ram REAL,
-                    net_sent REAL, net_recv REAL,
-                    disk_r REAL, disk_w REAL, cpu_temp REAL
-                )""")
-            # Migración columnas opcionales
-            cols = {r[1] for r in self._db.execute("PRAGMA table_info(connections)")}
-            for c, t in [("country","TEXT"),("org","TEXT")]:
-                if c not in cols:
-                    self._db.execute(f"ALTER TABLE connections ADD COLUMN {c} {t}")
-            self._db.commit()
-        except Exception:
-            self._db = None
-
     def _setup_tray(self):
         try:
             self._tray = _SysTray(on_show=self._restore_from_tray)
@@ -458,9 +324,7 @@ class Monitor:
         if self._tray: self._tray.remove()
         try:   _executor.shutdown(wait=False, cancel_futures=True)
         except: pass
-        try:
-            if self._db: self._db.close()
-        except: pass
+        self._db.close()
         self.root.destroy()
 
     # ── UI ──────────────────────────────────────────────────────────────────
@@ -514,12 +378,19 @@ class Monitor:
         self._session_lbl = tk.Label(root, text="Sesión: 0h 00m  |  Sospechosas: 0",
                                      font=("Segoe UI", 8), bg=BG, fg=DIM)
         self._session_lbl.pack()
+        self._status_lbl = tk.Label(root, text="● Iniciando...",
+                                    font=("Segoe UI", 9, "bold"), bg=BG, fg=DIM)
+        self._status_lbl.pack(pady=(2, 0))
         tk.Frame(root, height=1, bg=DIM).pack(fill="x", padx=30, pady=(8,12))
 
-        # Métricas grid
-        grid = tk.Frame(root, bg=BG)
-        grid.pack(padx=40, fill="x")
+        # Métricas card
+        _mc = tk.Frame(root, bg=BG2, padx=16, pady=10)
+        _mc.pack(padx=30, fill="x", pady=(0, 8))
+        grid = tk.Frame(_mc, bg=BG2)
+        grid.pack(fill="x")
         self._labels = {}
+        self._bars = {}
+        _bar_keys = {"cpu", "ram", "disk"}
         for i, (key, lbl) in enumerate([
             ("cpu",      "CPU"),
             ("cpu_temp", "Temp CPU"),
@@ -532,14 +403,20 @@ class Monitor:
             ("net_recv", "Red ↓"),
         ]):
             tk.Label(grid, text=lbl, font=("Segoe UI", 10, "bold"),
-                     bg=BG, fg=ACCENT, anchor="w", width=12,
-                     ).grid(row=i, column=0, pady=4, sticky="w")
+                     bg=BG2, fg=ACCENT, anchor="w", width=12,
+                     ).grid(row=i, column=0, pady=3, sticky="w")
             v = tk.Label(grid, text="...", font=("Segoe UI", 10),
-                         bg=BG, fg=FG, anchor="w")
-            v.grid(row=i, column=1, pady=4, sticky="w")
+                         bg=BG2, fg=FG, anchor="w", width=32)
+            v.grid(row=i, column=1, pady=3, sticky="w")
             self._labels[key] = v
-        self._ts_metrics = tk.Label(root, text="", font=("Segoe UI", 8), bg=BG, fg=DIM)
-        self._ts_metrics.pack(anchor="e", padx=40)
+            if key in _bar_keys:
+                bc = tk.Canvas(grid, bg=BG2, height=8, width=160,
+                               highlightthickness=0)
+                bc.grid(row=i, column=2, pady=3, padx=(12, 0), sticky="w")
+                self._bars[key] = bc
+        self._ts_metrics = tk.Label(_mc, text="", font=("Segoe UI", 8),
+                                    bg=BG2, fg=DIM, anchor="e")
+        self._ts_metrics.pack(fill="x", pady=(6, 0))
 
         # Gráfico de red
         nh = tk.Frame(root, bg=BG)
@@ -553,42 +430,44 @@ class Monitor:
         self._net_canvas.pack(fill="x", padx=40, pady=(0,10))
 
         # Top procesos
-        tk.Frame(root, height=1, bg=DIM).pack(fill="x", padx=30)
-        tp_h = tk.Frame(root, bg=BG)
-        tp_h.pack(fill="x", padx=30, pady=(8,2))
-        tk.Label(tp_h, text="Top procesos por CPU",
-                 font=("Segoe UI", 10, "bold"), bg=BG, fg=ACCENT).pack(side="left")
-        tf = tk.Frame(root, bg=BG2)
-        tf.pack(fill="x", padx=30, pady=(0,8))
-        self._top_text = tk.Text(tf, font=("Consolas", 9), bg=BG2, fg=FG,
+        _tp_card = tk.Frame(root, bg=BG2)
+        _tp_card.pack(fill="x", padx=30, pady=(0, 8))
+        tk.Frame(_tp_card, bg=ACCENT, width=3).pack(side="left", fill="y")
+        _tp_inner = tk.Frame(_tp_card, bg=BG2)
+        _tp_inner.pack(side="left", fill="both", expand=True, padx=(10, 8), pady=8)
+        tk.Label(_tp_inner, text="Top procesos por CPU",
+                 font=("Segoe UI", 10, "bold"), bg=BG2, fg=ACCENT).pack(anchor="w")
+        self._top_text = tk.Text(_tp_inner, font=("Consolas", 9), bg=BG2, fg=FG,
                                   relief="flat", bd=0, height=7,
                                   state="disabled", wrap="none")
-        self._top_text.pack(fill="x", padx=8, pady=4)
+        self._top_text.pack(fill="x", pady=(4, 0))
         for t, c in [("header", ACCENT), ("dim", DIM),
                      ("high", ORANGE), ("sys", PURPLE), ("normal", FG)]:
             self._top_text.tag_configure(t, foreground=c)
 
         # Conexiones
-        tk.Frame(root, height=1, bg=DIM).pack(fill="x", padx=30)
-        sec = tk.Frame(root, bg=BG)
-        sec.pack(fill="x", padx=30, pady=(8,2))
-        tk.Label(sec, text="Conexiones Externas — Anti-Troyano",
-                 font=("Segoe UI", 11, "bold"), bg=BG, fg=ACCENT).pack(side="left")
-        self._ts_conns = tk.Label(sec, text="(actualizando...)",
-                                  font=("Segoe UI", 8), bg=BG, fg=DIM)
+        _cn_card = tk.Frame(root, bg=BG2)
+        _cn_card.pack(fill="x", padx=30, pady=(0, 8))
+        tk.Frame(_cn_card, bg=RED, width=3).pack(side="left", fill="y")
+        _cn_inner = tk.Frame(_cn_card, bg=BG2)
+        _cn_inner.pack(side="left", fill="both", expand=True, padx=(10, 8), pady=8)
+        _cn_hdr = tk.Frame(_cn_inner, bg=BG2)
+        _cn_hdr.pack(fill="x")
+        tk.Label(_cn_hdr, text="Conexiones Externas — Anti-Troyano",
+                 font=("Segoe UI", 11, "bold"), bg=BG2, fg=ACCENT).pack(side="left")
+        self._ts_conns = tk.Label(_cn_hdr, text="(actualizando...)",
+                                  font=("Segoe UI", 8), bg=BG2, fg=DIM)
         self._ts_conns.pack(side="right")
-        leg = tk.Frame(root, bg=BG)
-        leg.pack(fill="x", padx=30, pady=(0,4))
-        for txt, col in [("■ Sospechoso", RED), ("■ VT limpio", YELLOW),
-                         ("■ Puerto peligroso", ORANGE), ("  hover → info", DIM)]:
-            tk.Label(leg, text=txt, font=("Consolas", 8),
-                     bg=BG, fg=col).pack(side="left", padx=(0,12))
-        cf2 = tk.Frame(root, bg=BG2)
-        cf2.pack(fill="x", padx=30, pady=(0,8))
-        self._conn_text = tk.Text(cf2, font=("Consolas", 9), bg=BG2, fg=FG,
+        _leg = tk.Frame(_cn_inner, bg=BG2)
+        _leg.pack(fill="x", pady=(2, 4))
+        for txt, col in [("● Sospechoso", RED), ("● VT limpio", YELLOW),
+                         ("● Puerto peligroso", ORANGE), ("  hover → info", DIM)]:
+            tk.Label(_leg, text=txt, font=("Consolas", 8),
+                     bg=BG2, fg=col).pack(side="left", padx=(0, 12))
+        self._conn_text = tk.Text(_cn_inner, font=("Consolas", 9), bg=BG2, fg=FG,
                                    insertbackground=BG2, relief="flat", bd=0,
                                    height=13, state="disabled", wrap="none")
-        self._conn_text.pack(fill="x", padx=8, pady=6)
+        self._conn_text.pack(fill="x")
         for tag, col in [("header", ACCENT), ("dim", DIM), ("suspicious", RED),
                          ("vt_safe", YELLOW), ("port_bad", ORANGE), ("safe", FG)]:
             self._conn_text.tag_configure(tag, foreground=col)
@@ -726,6 +605,9 @@ class Monitor:
             self._labels["net_recv"].config(text=_fmt_bytes(rp)+"/s", fg=FG)
             self._ts_metrics.config(
                 text=f"metricas: {time.strftime('%H:%M:%S')}", fg=DIM)
+            self._draw_bar("cpu",  cpu,        100, RED if cpu >= self._cpu_thresh else ACCENT)
+            self._draw_bar("ram",  mem.percent, 100, RED if mem.percent >= self._ram_thresh else GREEN_OK)
+            self._draw_bar("disk", dp,          100, RED if dp >= self._disk_thresh else YELLOW)
 
             self._net_sent_hist.append(sp)
             self._net_recv_hist.append(rp)
@@ -738,6 +620,7 @@ class Monitor:
 
             self._check_resource_alerts(cpu, mem.percent, dp)
             self._update_top_procs()
+            self._update_status_header()
         except Exception as e:
             self._ts_metrics.config(text=f"Error: {e}", fg=RED)
         self.root.after(REFRESH_METRICS, self._tick_metrics)
@@ -761,6 +644,42 @@ class Monitor:
                 self._tray.notify("⚠ Disco lleno", f"C: al {disk:.0f}%", warning=True)
         elif disk < self._disk_thresh - 3:
             self._disk_alerted = False
+
+    def _update_status_header(self):
+        active_susp = len(self._suspicious_ips)
+        cpu_warn = self._last_cpu >= self._cpu_thresh
+        ram_warn = self._last_ram >= self._ram_thresh
+        if active_susp:
+            n = active_susp
+            text = f"⚠  {n} conexión{'es' if n > 1 else ''} sospechosa{'s' if n > 1 else ''} activa{'s' if n > 1 else ''}"
+            col = RED
+        elif cpu_warn or ram_warn:
+            parts = []
+            if cpu_warn: parts.append(f"CPU {self._last_cpu:.0f}%")
+            if ram_warn: parts.append(f"RAM {self._last_ram:.0f}%")
+            text = "⚠  Recursos elevados: " + "  |  ".join(parts)
+            col = ORANGE
+        else:
+            text = "●  Sistema sano"
+            col = GREEN_OK
+        try:
+            self._status_lbl.config(text=text, fg=col)
+        except Exception:
+            pass
+
+    def _draw_bar(self, key: str, value: float, maximum: float, color: str):
+        bc = self._bars.get(key)
+        if bc is None: return
+        try:
+            bc.delete("all")
+            w = bc.winfo_width() or 160
+            h = bc.winfo_height() or 8
+            fill_w = int(min(value / maximum, 1.0) * w)
+            bc.create_rectangle(0, 0, w, h, fill="#333333", outline="")
+            if fill_w > 0:
+                bc.create_rectangle(0, 0, fill_w, h, fill=color, outline="")
+        except Exception:
+            pass
 
     def _redraw_net_graph(self):
         try:
@@ -827,27 +746,10 @@ class Monitor:
     # ── Temp CPU ────────────────────────────────────────────────────────────
 
     def _tick_temp(self):
-        fut = _executor.submit(self._bg_cpu_temp)
+        fut = _executor.submit(security.cpu_temp)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_temp_done, f))
         self.root.after(TEMP_INTERVAL, self._tick_temp)
-
-    @staticmethod
-    def _bg_cpu_temp() -> float:
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-WmiObject -Namespace root\\wmi "
-                 "-Class MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue"
-                 " | Select-Object -First 1 -ExpandProperty CurrentTemperature"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            raw = r.stdout.strip()
-            if raw and raw.lstrip("-").isdigit():
-                return round(int(raw) / 10.0 - 273.15, 1)
-        except Exception:
-            pass
-        return -1.0
 
     def _on_temp_done(self, future):
         try:
@@ -864,49 +766,10 @@ class Monitor:
     # ── GPU ─────────────────────────────────────────────────────────────────
 
     def _tick_gpu(self):
-        fut = _executor.submit(self._bg_gpu_info)
+        fut = _executor.submit(security.gpu_info)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_gpu_done, f))
         self.root.after(GPU_INTERVAL, self._tick_gpu)
-
-    @staticmethod
-    def _bg_gpu_info() -> dict:
-        # Intento 1: nvidia-smi
-        try:
-            r = subprocess.run(
-                ["nvidia-smi",
-                 "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            if r.returncode == 0 and r.stdout.strip():
-                p = [x.strip() for x in r.stdout.strip().split(",")]
-                if len(p) >= 5:
-                    return {"vendor": "NVIDIA", "name": p[0],
-                            "util": float(p[1]), "mem_used": float(p[2]),
-                            "mem_total": float(p[3]), "temp": float(p[4])}
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-        # Intento 2: WMI (nombre y VRAM solamente)
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-WmiObject Win32_VideoController "
-                 "| Select-Object -First 1 Name,AdapterRAM "
-                 "| ForEach-Object { $_.Name + '|' + $_.AdapterRAM }"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            out = r.stdout.strip()
-            if out and "|" in out:
-                name, vram = out.split("|", 1)
-                vram_mb = int(vram.strip() or 0) // 1_048_576
-                return {"vendor": "WMI", "name": name.strip(),
-                        "vram_mb": vram_mb}
-        except Exception:
-            pass
-        return {}
 
     def _on_gpu_done(self, future):
         try:
@@ -932,19 +795,11 @@ class Monitor:
 
     def _tick_save_metrics(self):
         try:
-            if self._db:
-                self._db.execute(
-                    "INSERT INTO metrics_history "
-                    "(timestamp,cpu,ram,net_sent,net_recv,disk_r,disk_w,cpu_temp) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (time.strftime("%Y-%m-%d %H:%M:%S"),
-                     self._last_cpu, self._last_ram,
-                     self._last_sent, self._last_recv,
-                     self._last_dr, self._last_dw, self._cpu_temp))
-                self._db.execute(
-                    "DELETE FROM metrics_history "
-                    "WHERE timestamp < datetime('now','-24 hours')")
-                self._db.commit()
+            self._db.save_metrics(
+                self._last_cpu, self._last_ram,
+                self._last_sent, self._last_recv,
+                self._last_dr, self._last_dw, self._cpu_temp)
+            self._db.trim_old_metrics()
         except Exception:
             pass
         self.root.after(METRICS_SAVE_MS, self._tick_save_metrics)
@@ -952,26 +807,10 @@ class Monitor:
     # ── Tareas programadas ──────────────────────────────────────────────────
 
     def _tick_sched(self):
-        fut = _executor.submit(self._bg_sched_tasks)
+        fut = _executor.submit(security.sched_tasks)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_sched_done, f))
         self.root.after(SCHED_INTERVAL, self._tick_sched)
-
-    @staticmethod
-    def _bg_sched_tasks() -> set:
-        try:
-            r = subprocess.run(
-                ["schtasks", "/query", "/fo", "CSV"],
-                capture_output=True, text=True, timeout=15,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            tasks = set()
-            for line in r.stdout.splitlines()[1:]:
-                line = line.strip().strip('"')
-                if line:
-                    tasks.add(line.split('","')[0])
-            return tasks
-        except Exception:
-            return set()
 
     def _on_sched_done(self, future):
         try:
@@ -993,43 +832,12 @@ class Monitor:
     # ── Registro Run/RunOnce ────────────────────────────────────────────────
 
     def _tick_reg(self):
-        if not _WINREG:
+        if not security.WINREG:
             return
-        fut = _executor.submit(self._bg_reg_keys)
+        fut = _executor.submit(security.reg_keys)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_reg_done, f))
         self.root.after(REG_INTERVAL, self._tick_reg)
-
-    @staticmethod
-    def _bg_reg_keys() -> dict:
-        result = {}
-        if not _WINREG:
-            return result
-        paths = [
-            (winreg.HKEY_LOCAL_MACHINE,
-             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-            (winreg.HKEY_CURRENT_USER,
-             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-            (winreg.HKEY_LOCAL_MACHINE,
-             r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
-            (winreg.HKEY_CURRENT_USER,
-             r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
-        ]
-        for hive, path in paths:
-            try:
-                key = winreg.OpenKey(hive, path)
-                i = 0
-                while True:
-                    try:
-                        name, val, _ = winreg.EnumValue(key, i)
-                        result[f"{path}\\{name}"] = str(val)
-                        i += 1
-                    except OSError:
-                        break
-                winreg.CloseKey(key)
-            except Exception:
-                pass
-        return result
 
     def _on_reg_done(self, future):
         try:
@@ -1052,7 +860,8 @@ class Monitor:
 
     def _tick_conns(self):
         try:
-            rows, susp_ips = self._collect_conns()
+            rows, susp_ips = network.collect_conns(
+                self._session_bytes, self._prev_io, self._user_whitelist)
             self._suspicious_ips  = susp_ips
             self._suspicious_rows = [r for r in rows if r["suspicious"] or r["port_bad"]]
             self._last_rows       = rows
@@ -1063,62 +872,12 @@ class Monitor:
             for ip in susp_ips: self._enqueue_vt("ip", ip)
             for r in rows:
                 if r["suspicious"] and r["pid"]: self._enqueue_hash_check(r["pid"])
-        except Exception as e:
-            self._ts_conns.config(text=f"Error: {e}", fg=RED)
-        self.root.after(REFRESH_CONNS, self._tick_conns)
-
-    def _collect_conns(self):
-        try:
-            raw = psutil.net_connections(kind="tcp")
         except (psutil.AccessDenied, PermissionError):
             self._ts_conns.config(
                 text="Sin permisos — ejecuta como Administrador", fg=RED)
-            return [], []
-        except Exception:
-            return [], []
-        rows = []; seen_ips = {}
-        for c in raw:
-            if not c.raddr: continue
-            ip = c.raddr.ip
-            if not _is_external(ip): continue
-            if c.status not in ("ESTABLISHED","LISTEN"): continue
-            pid  = c.pid or 0
-            name = _proc_name(pid) if pid else "N/A"
-            curr = _proc_io_other(pid)
-            prev = self._prev_io.get(pid, curr)
-            self._prev_io[pid] = curr
-            self._session_bytes[pid] = (
-                self._session_bytes.get(pid, 0) + max(curr-prev, 0))
-            port_bad  = c.raddr.port in SUSPICIOUS_PORTS
-            suspicious = ((name not in WHITELIST and name not in self._user_whitelist)
-                          or port_bad)
-            if suspicious: seen_ips[ip] = None
-            # Proceso padre
-            parent_name = ""
-            try:
-                par = psutil.Process(pid).parent()
-                parent_name = par.name() if par else ""
-            except Exception:
-                pass
-            # Privilegios
-            uname = ""; elevated = False
-            try:
-                uname = psutil.Process(pid).username() or ""
-                elevated = any(k in uname.upper()
-                               for k in ("SYSTEM","NT AUTHORITY"))
-            except Exception:
-                pass
-            rows.append({
-                "proc": name, "pid": pid, "ip": ip,
-                "port": c.raddr.port, "state": c.status,
-                "mb": self._session_bytes.get(pid,0)/1024**2,
-                "suspicious": suspicious, "port_bad": port_bad,
-                "parent": parent_name,
-                "user": uname, "elevated": elevated,
-            })
-        rows.sort(key=lambda r: (0 if (r["suspicious"] or r["port_bad"]) else 1,
-                                  r["proc"].lower()))
-        return rows[:10], list(seen_ips)
+        except Exception as e:
+            self._ts_conns.config(text=f"Error: {e}", fg=RED)
+        self.root.after(REFRESH_CONNS, self._tick_conns)
 
     def _render_conns(self, rows: list, susp_count: int):
         w = self._conn_text
@@ -1147,8 +906,10 @@ class Monitor:
                         tag = "suspicious"
                 else:
                     tag = "safe"
+                w.insert("end", "● ", tag)
                 w.insert("end", line+"\n", tag)
         w.config(state="disabled")
+        self._update_status_header()
         self._ts_conns.config(
             text=f"conexiones: {time.strftime('%H:%M:%S')}", fg=DIM)
         if susp_count:
@@ -1273,22 +1034,9 @@ class Monitor:
     # ── Historial conexiones ─────────────────────────────────────────────────
 
     def _save_to_history(self, rows: list):
-        if not self._db: return
         try:
-            susp = [r for r in rows if r["suspicious"] or r["port_bad"]]
-            if susp:
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                for r in susp:
-                    info = self._ip_info.get(r["ip"]) or {}
-                    self._db.execute(
-                        "INSERT INTO connections "
-                        "(timestamp,proc,pid,ip,port,state,mb,suspicious,country,org) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (ts,r["proc"],r["pid"],r["ip"],r["port"],
-                         r["state"],r["mb"],1,
-                         info.get("country",""),info.get("org","")))
-                self._db.commit()
-                self._session_susp += len(susp)
+            saved = self._db.save_connections(rows, self._ip_info)
+            self._session_susp += saved
         except Exception:
             pass
 
@@ -1339,14 +1087,9 @@ class Monitor:
                 return
         except Exception:
             return
-        if not self._db: return
         try:
-            flt = self._hist_filter.get().strip().lower()
-            q = ("SELECT timestamp,proc,pid,ip,port,state,mb,country,org "
-                 "FROM connections "
-                 +("WHERE LOWER(proc) LIKE ? OR LOWER(ip) LIKE ? " if flt else "")
-                 +"ORDER BY id DESC LIMIT 200")
-            rows = self._db.execute(q, (f"%{flt}%",f"%{flt}%") if flt else ()).fetchall()
+            flt  = self._hist_filter.get().strip().lower()
+            rows = self._db.load_connections(flt)
             w = self._hist_text
             w.config(state="normal"); w.delete("1.0","end")
             hdr = (f"{'Timestamp':<20}{'Proceso':<18}{'PID':<7}"
@@ -1366,33 +1109,25 @@ class Monitor:
             pass
 
     def _export_csv(self):
-        if not self._db: return
         try:
             path = filedialog.asksaveasfilename(
                 parent=self._hist_win, defaultextension=".csv",
                 filetypes=[("CSV","*.csv")], initialfile="monitor_history.csv")
             if not path: return
-            rows = self._db.execute(
-                "SELECT timestamp,proc,pid,ip,port,state,mb,country,org "
-                "FROM connections ORDER BY id DESC LIMIT 5000").fetchall()
-            with open(path,"w",newline="",encoding="utf-8-sig") as f:
-                wr = csv.writer(f)
-                wr.writerow(["timestamp","proc","pid","ip","port",
-                             "state","mb","country","org"])
-                wr.writerows(rows)
+            count = self._db.export_csv(path)
             messagebox.showinfo("Exportar CSV",
-                                f"Exportado: {len(rows)} registros",
+                                f"Exportado: {count} registros",
                                 parent=self._hist_win)
         except Exception as e:
             messagebox.showerror("Error", str(e), parent=self._hist_win)
 
     def _clear_history(self):
-        if not self._db: return
         if not messagebox.askyesno("Limpiar","¿Borrar todo el historial?",
                                    parent=self._hist_win): return
         try:
-            self._db.execute("DELETE FROM connections")
-            self._db.commit(); self._session_susp = 0; self._load_history()
+            self._db.clear_connections()
+            self._session_susp = 0
+            self._load_history()
         except Exception:
             pass
 
@@ -1447,9 +1182,7 @@ class Monitor:
         for w in self._mhist_inner.winfo_children(): w.destroy()
 
         try:
-            rows = self._db.execute(
-                "SELECT cpu,ram,net_sent,net_recv,disk_r,disk_w,cpu_temp "
-                "FROM metrics_history ORDER BY id ASC").fetchall()
+            rows = self._db.load_metrics()
         except Exception:
             return
         if not rows: return
@@ -1705,54 +1438,19 @@ class Monitor:
         ips = list(self._suspicious_ips); rows = list(self._suspicious_rows)
         if not ips:
             self._susp_lbl.config(text="  No hay IPs sospechosas", fg=DIM); return
-        ok = _clipboard_set(self._build_report(ips, rows))
+        ok = utils.clipboard_set(network.build_report(ips, rows))
         self._susp_lbl.config(
             text=f"  {len(ips)} IP(s) copiadas" if ok else "  Error portapapeles",
             fg=GREEN_OK if ok else RED)
-
-    @staticmethod
-    def _build_report(ips: list, rows: list) -> str:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S"); sep="="*60; sep2="-"*60
-        hdr = f"{'Proceso':<17}{'PID':<7}{'IP Remota':<18}{'Puerto':<8}{'Estado':<14}MB"
-        lines = [sep,"  SYSTEM MONITOR - Conexiones Sospechosas",
-                 f"  {ts}",sep,"",hdr,sep2]
-        for r in rows:
-            lines.append(f"{r['proc'][:16]:<17}{str(r['pid']):<7}{r['ip']:<18}"
-                         f"{str(r['port']):<8}{r['state']:<14}{r['mb']:.2f}")
-        lines += ["",sep2,"IPs para VirusTotal:",""]
-        lines += [f"  {ip}" for ip in ips]
-        lines += ["",sep]
-        return "\n".join(lines)
 
     # ── Resolución hostname/ASN/país ─────────────────────────────────────────
 
     def _resolve_ip_async(self, ip: str):
         if ip in self._ip_info: return
         self._ip_info[ip] = {"host":"...","org":"...","country":"...","pending":True}
-        fut = _executor.submit(self._bg_resolve_ip, ip)
+        fut = _executor.submit(network.resolve_ip, ip)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_resolve_done, ip, f))
-
-    @staticmethod
-    def _bg_resolve_ip(ip: str) -> dict:
-        res = {"host": ip, "org": "", "country": "", "lat": None, "lon": None}
-        try:    res["host"] = socket.gethostbyaddr(ip)[0]
-        except: pass
-        try:
-            req = urllib.request.Request(
-                f"https://ipinfo.io/{ip}/json",
-                headers={"User-Agent":"system-monitor/1.0"})
-            with urllib.request.urlopen(req, timeout=6) as r:
-                d = json.loads(r.read())
-            res["org"]     = d.get("org","")
-            res["country"] = d.get("country","")
-            loc = d.get("loc","")
-            if loc and "," in loc:
-                la, lo = loc.split(",", 1)
-                res["lat"] = float(la); res["lon"] = float(lo)
-        except Exception:
-            pass
-        return res
 
     def _on_resolve_done(self, ip: str, future):
         try:    self._ip_info[ip] = {**future.result(), "pending":False}
@@ -1794,20 +1492,9 @@ class Monitor:
         cache = self._vt_ip_cache if kind=="ip" else self._hash_vt_cache
         if val in cache and not cache[val].get("pending"): return
         cache[val] = {"pending":True}; self._vt_daily += 1
-        fut = _executor.submit(self._bg_vt_lookup, kind, val, api_key)
+        fut = _executor.submit(network.vt_lookup, kind, val, api_key)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_vt_done, kind, val, f))
-
-    @staticmethod
-    def _bg_vt_lookup(kind: str, val: str, api_key: str) -> dict:
-        ep  = "ip_addresses" if kind=="ip" else "files"
-        req = urllib.request.Request(
-            f"https://www.virustotal.com/api/v3/{ep}/{val}",
-            headers={"x-apikey":api_key,"User-Agent":"system-monitor/1.0"})
-        with urllib.request.urlopen(req, timeout=12) as r:
-            d = json.loads(r.read())
-        s = d["data"]["attributes"]["last_analysis_stats"]
-        return {k:s.get(k,0) for k in ("malicious","suspicious","harmless","undetected")}
 
     def _on_vt_done(self, kind: str, val: str, future):
         cache = self._vt_ip_cache if kind=="ip" else self._hash_vt_cache
@@ -1821,41 +1508,9 @@ class Monitor:
     def _check_sig_async(self, exe: str):
         if exe in self._sig_cache: return
         self._sig_cache[exe] = {"pending":True,"signed":None,"publisher":""}
-        fut = _executor.submit(self._bg_check_sig, exe)
+        fut = _executor.submit(security.check_sig, exe)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_sig_done, exe, f))
-
-    @staticmethod
-    def _bg_check_sig(exe: str) -> dict:
-        try:
-            r = subprocess.run(
-                ["sigcheck.exe","-nobanner","-accepteula","-q",exe],
-                capture_output=True, text=True, timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            out = r.stdout+r.stderr
-            if "Verified:" in out:
-                signed = "Unsigned" not in out; pub = ""
-                for l in out.splitlines():
-                    if l.strip().startswith("Publisher:"):
-                        pub=l.split(":",1)[1].strip(); break
-                return {"signed":signed,"publisher":pub}
-        except FileNotFoundError: pass
-        except Exception: pass
-        try:
-            esc = exe.replace("'","''")
-            ps  = (f"$s=(Get-AuthenticodeSignature '{esc}');"
-                   "$s.Status.ToString()+'|'+"
-                   "($s.SignerCertificate.Subject -replace '.*CN=([^,]+).*','$1')")
-            r = subprocess.run(
-                ["powershell","-NoProfile","-Command",ps],
-                capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            out = r.stdout.strip()
-            if "|" in out:
-                status,pub = out.split("|",1)
-                return {"signed":status.strip()=="Valid","publisher":pub.strip()}
-        except Exception: pass
-        return {"signed":None,"publisher":""}
 
     def _on_sig_done(self, exe: str, future):
         try:    self._sig_cache[exe] = {**future.result(),"pending":False}
@@ -1880,20 +1535,9 @@ class Monitor:
             if h: self._enqueue_vt("hash",h)
             return
         self._exe_hash[pid] = None
-        fut = _executor.submit(self._bg_compute_hash, pid)
+        fut = _executor.submit(security.compute_hash, pid)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_hash_done, pid, f))
-
-    @staticmethod
-    def _bg_compute_hash(pid: int) -> str:
-        try:
-            exe = psutil.Process(pid).exe()
-            sha = hashlib.sha256()
-            with open(exe,"rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""): sha.update(chunk)
-            return sha.hexdigest()
-        except Exception:
-            return ""
 
     def _on_hash_done(self, pid: int, future):
         try:
@@ -1995,37 +1639,10 @@ class Monitor:
     # ── Event Log Windows ────────────────────────────────────────────────────
 
     def _tick_evtlog(self):
-        fut = _executor.submit(self._bg_evtlog)
+        fut = _executor.submit(security.evtlog)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_evtlog_done, f))
         self.root.after(EVTLOG_INTERVAL, self._tick_evtlog)
-
-    @staticmethod
-    def _bg_evtlog() -> list:
-        ids_str = ",".join(str(i) for i in _EVTLOG_IDS)
-        ps_cmd = (
-            f"$ids=@({ids_str});"
-            "Get-WinEvent -FilterHashtable @{LogName='Security','System';"
-            f"Id=$ids}} -MaxEvents 30 -ErrorAction SilentlyContinue"
-            " | Select-Object Id,TimeCreated,"
-            "@{N='Msg';E={$_.Message.Substring(0,[Math]::Min(180,$_.Message.Length))}}"
-            " | ForEach-Object { $_.Id.ToString()+'|'+$_.TimeCreated.ToString('s')+'|'+$_.Msg }"
-        )
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True, timeout=12,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            events = []
-            for line in r.stdout.splitlines():
-                parts = line.split("|", 2)
-                if len(parts) == 3:
-                    eid, ts, msg = parts
-                    events.append({"id": eid.strip(), "ts": ts.strip(),
-                                   "msg": msg.strip()[:160]})
-            return events
-        except Exception:
-            return []
 
     def _on_evtlog_done(self, future):
         try:
@@ -2105,29 +1722,10 @@ class Monitor:
         susp_pids = [r["pid"] for r in self._last_rows
                      if r.get("suspicious") and r.get("pid")]
         if susp_pids:
-            fut = _executor.submit(self._bg_scan_dlls, susp_pids)
+            fut = _executor.submit(security.scan_dlls, susp_pids)
             fut.add_done_callback(
                 lambda f: self.root.after(0, self._on_dll_done, f))
         self.root.after(DLL_INTERVAL, self._tick_dll)
-
-    @staticmethod
-    def _bg_scan_dlls(pids: list) -> list:
-        findings = []
-        for pid in pids:
-            try:
-                proc = psutil.Process(pid)
-                exe_dir = os.path.dirname(proc.exe()).lower()
-                for m in proc.memory_maps():
-                    path = m.path.lower() if hasattr(m,"path") else ""
-                    if not path.endswith(".dll"): continue
-                    safe = any(path.startswith(d) for d in _SAFE_DLL_DIRS)
-                    if not safe and not path.startswith(exe_dir):
-                        findings.append({
-                            "pid": pid, "proc": proc.name(),
-                            "dll": m.path[:80]})
-            except Exception:
-                pass
-        return findings
 
     def _on_dll_done(self, future):
         try:
@@ -2143,26 +1741,10 @@ class Monitor:
     # ── Monitor de servicios ─────────────────────────────────────────────────
 
     def _tick_services(self):
-        fut = _executor.submit(self._bg_scan_services)
+        fut = _executor.submit(security.scan_services)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_services_done, f))
         self.root.after(SVC_INTERVAL, self._tick_services)
-
-    @staticmethod
-    def _bg_scan_services() -> set:
-        try:
-            r = subprocess.run(
-                ["sc","query","state=","all"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            svcs = set()
-            for line in r.stdout.splitlines():
-                line = line.strip()
-                if line.startswith("SERVICE_NAME:"):
-                    svcs.add(line.split(":",1)[1].strip())
-            return svcs
-        except Exception:
-            return set()
 
     def _on_services_done(self, future):
         try:
@@ -2184,18 +1766,10 @@ class Monitor:
     # ── Integridad de hosts file ─────────────────────────────────────────────
 
     def _tick_hosts(self):
-        fut = _executor.submit(self._bg_hash_hosts)
+        fut = _executor.submit(security.hash_hosts)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_hosts_done, f))
         self.root.after(HOSTS_INTERVAL, self._tick_hosts)
-
-    @staticmethod
-    def _bg_hash_hosts() -> str:
-        try:
-            with open(_HOSTS_PATH, "rb") as f:
-                return hashlib.sha256(f.read()).hexdigest()
-        except Exception:
-            return ""
 
     def _on_hosts_done(self, future):
         try:
@@ -2215,31 +1789,10 @@ class Monitor:
     # ── DNS sospechoso ───────────────────────────────────────────────────────
 
     def _tick_dns(self):
-        fut = _executor.submit(self._bg_scan_dns)
+        fut = _executor.submit(security.scan_dns)
         fut.add_done_callback(
             lambda f: self.root.after(0, self._on_dns_done, f))
         self.root.after(DNS_INTERVAL, self._tick_dns)
-
-    @staticmethod
-    def _bg_scan_dns() -> list:
-        _BAD_TLD = {".ru",".cn",".tk",".xyz",".top",".pw",".cc",".su"}
-        _KEYWORDS = {"payload","c2","shell","bot","rat","malware","exploit","cmd"}
-        suspicious = []
-        try:
-            r = subprocess.run(
-                ["ipconfig","/displaydns"],
-                capture_output=True, text=True, timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            for line in r.stdout.splitlines():
-                if "Nombre de registro" in line or "Record Name" in line:
-                    domain = line.split(":",1)[-1].strip().lower().rstrip(".")
-                    bad = (any(domain.endswith(t) for t in _BAD_TLD)
-                           or any(k in domain for k in _KEYWORDS))
-                    if bad:
-                        suspicious.append(domain)
-        except Exception:
-            pass
-        return list(dict.fromkeys(suspicious))
 
     def _on_dns_done(self, future):
         try:
@@ -2386,16 +1939,13 @@ font-size:11px;background:#252526}"""
                             f'<td class="{cls}">{lbl}</td>'
                             f'<td>{e["ts"]}</td><td>{e["msg"][:80]}</td></tr>\n')
         history_html = ""
-        if self._db:
-            try:
-                hist_rows = self._db.execute(
-                    "SELECT timestamp,proc,ip,port,state,country FROM connections "
-                    "ORDER BY id DESC LIMIT 50").fetchall()
-                for ts2,proc,ip,port,state,country in hist_rows:
-                    history_html += (f'<tr class="susp"><td>{ts2}</td><td>{proc}</td>'
-                                     f'<td>{ip}</td><td>{port}</td><td>{state}</td>'
-                                     f'<td>{country or ""}</td></tr>\n')
-            except Exception: pass
+        try:
+            hist_rows = self._db.load_recent_connections()
+            for ts2,proc,ip,port,state,country in hist_rows:
+                history_html += (f'<tr class="susp"><td>{ts2}</td><td>{proc}</td>'
+                                 f'<td>{ip}</td><td>{port}</td><td>{state}</td>'
+                                 f'<td>{country or ""}</td></tr>\n')
+        except Exception: pass
         gpu_s = "N/D"
         if self._gpu_info:
             if self._gpu_info.get("vendor")=="NVIDIA":
