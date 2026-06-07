@@ -6,6 +6,8 @@ Módulos: utils · db · network · security
 """
 import tkinter as tk
 from tkinter import messagebox, simpledialog, filedialog
+import ctypes
+import ctypes.wintypes
 import time
 import sys
 import subprocess
