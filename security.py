@@ -29,6 +29,17 @@ except ImportError:
 # ── CPU temperature ──────────────────────────────────────────────────────────
 
 def cpu_temp() -> float:
+    # Cascada de tres fuentes con distinto nivel de privilegio y precisión:
+    # 1. Win32_PerfFormattedData_Counters_ThermalZoneInformation — disponible sin
+    #    admin, devuelve temperatura de zona térmica (no por núcleo) en Kelvin.
+    #    Es la única fuente que funciona con el diseño "sin admin" del programa.
+    # 2. MSAcpi_ThermalZoneTemperature — también zona térmica pero en décimas de
+    #    Kelvin; requiere admin. Se intenta como fallback por si el WMI provider
+    #    de Performance Counters no está disponible.
+    # 3. LibreHardwareMonitor WMI — si el usuario tiene LHM corriendo en segundo
+    #    plano, expone temperaturas por núcleo con alta precisión. No requiere admin
+    #    siempre que el servicio LHM esté activo.
+    # Retorna -1.0 si ninguna fuente funciona (la UI muestra "N/D").
     # Intento 1: Performance counters — no requiere admin, valores en Kelvin
     try:
         r = subprocess.run(
@@ -178,6 +189,11 @@ def reg_keys() -> dict:
 # ── DLL injection detection ───────────────────────────────────────────────────
 
 def scan_dlls(pids: list) -> list:
+    # Heurística de DLL injection: una DLL es sospechosa si no está en ninguno
+    # de los directorios del sistema conocidos (SAFE_DLL_DIRS) ni en el mismo
+    # directorio que el ejecutable del proceso. Los falsos positivos son comunes
+    # (plugins legítimos, frameworks .NET/Java), por eso solo se escanean los
+    # PIDs ya marcados como sospechosos por collect_conns.
     findings = []
     for pid in pids:
         try:

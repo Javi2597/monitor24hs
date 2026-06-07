@@ -9,6 +9,11 @@ _ALLOWED_COLS = {"country": "TEXT", "org": "TEXT"}
 
 class HistoryDB:
     def __init__(self, path: str):
+        # check_same_thread=False permite que hilos del ThreadPoolExecutor llamen
+        # a métodos de lectura, pero todas las escrituras se protegen con _lock
+        # para serializar acceso concurrente y evitar "database is locked".
+        # WAL (Write-Ahead Log) permite lecturas concurrentes sin bloquear
+        # escrituras, al contrario del modo journal por defecto (DELETE).
         self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -26,6 +31,10 @@ class HistoryDB:
                 net_sent REAL, net_recv REAL,
                 disk_r REAL, disk_w REAL, cpu_temp REAL
             )""")
+        # Migración no destructiva: añade columnas nuevas si la BD fue creada con
+        # una versión anterior del esquema. PRAGMA table_info devuelve una fila por
+        # columna; el campo [1] es el nombre. ALTER TABLE en SQLite no admite
+        # parámetros, de ahí el f-string con valores validados contra _ALLOWED_COLS.
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(connections)")}
         for col, typ in _ALLOWED_COLS.items():
             if col not in cols:

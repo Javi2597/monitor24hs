@@ -30,6 +30,10 @@ def collect_conns(session_bytes: dict, prev_io: dict,
             continue
         pid  = c.pid or 0
         name = utils.proc_name(pid) if pid else "N/A"
+        # Delta de I/O por PID: psutil devuelve bytes totales desde el inicio del
+        # proceso, no una tasa. Se guarda el valor anterior en prev_io y se acumula
+        # solo el incremento positivo. max(..., 0) descarta decrementos esporádicos
+        # causados por resúmenes de kernel inconsistentes entre llamadas.
         curr = utils.proc_io_other(pid)
         prev = prev_io.get(pid, curr)
         prev_io[pid] = curr
@@ -58,6 +62,9 @@ def collect_conns(session_bytes: dict, prev_io: dict,
             "suspicious": suspicious, "port_bad": port_bad,
             "parent": parent_name, "user": uname, "elevated": elevated,
         })
+    # Ordenar: sospechosos y puertos malos primero (clave 0), luego por nombre.
+    # La tupla como clave de sort permite ordenación estable en dos niveles
+    # sin necesidad de múltiples pasadas.
     rows.sort(key=lambda r: (0 if (r["suspicious"] or r["port_bad"]) else 1,
                               r["proc"].lower()))
     return rows[:10], list(seen_ips)

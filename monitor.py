@@ -58,6 +58,11 @@ _HEADER = (f"{'Proceso':<{_C['proc']}}{' PID':<{_C['pid']}}"
            f"{'Estado':<{_C['state']}}MB Env.")
 _SEP = "-" * sum(_C.values())
 
+# Todos los _tick_* siguen el mismo patrón de concurrencia segura con Tkinter:
+#   fut = _executor.submit(fn_bloqueante)
+#   fut.add_done_callback(lambda f: self.root.after(0, self._on_done, f))
+# root.after(0, cb) encola cb en el hilo principal de Tkinter, garantizando
+# que ningún widget se toca desde un thread secundario.
 _executor  = ThreadPoolExecutor(max_workers=6, thread_name_prefix="mon_bg")
 _TASK_NAME = "SystemMonitorApp"
 
@@ -72,6 +77,15 @@ _save_cfg     = utils.save_cfg
 
 # ─── Bandeja del sistema ────────────────────────────────────────────────────
 
+# ── Bandeja del sistema via Win32 API ──────────────────────────────────────
+# Tkinter no expone la bandeja del sistema, así que se usa la Win32 API
+# directamente con ctypes. El flujo es:
+#   1. Registrar una clase de ventana "fantasma" (invisible, solo para recibir mensajes)
+#   2. Crear la ventana con CreateWindowExW usando HWND_MESSAGE (-3) como padre,
+#      lo que la hace un "message-only window" — nunca visible en pantalla
+#   3. Añadir el icono a la bandeja con Shell_NotifyIconW (NIM_ADD)
+#   4. Sondear la cola de mensajes en cada tick del bucle principal (poll())
+# Las notificaciones "toast" usan NIM_MODIFY con el flag NIF_INFO.
 class _SysTray:
     _WM_TRAY = 0x0401
     _NIM_ADD = 0; _NIM_MODIFY = 1; _NIM_DELETE = 2
@@ -630,6 +644,10 @@ class Monitor:
         self.root.after(REFRESH_METRICS, self._tick_metrics)
 
     def _check_resource_alerts(self, cpu: float, ram: float, disk: float = 0.0):
+        # Histéresis intencional: la alerta se activa al superar el umbral pero
+        # solo se desactiva cuando el valor baja 5 puntos por debajo. Esto evita
+        # que un valor que oscila exactamente en el umbral genere una ráfaga de
+        # notificaciones repetidas en cada tick.
         if cpu >= self._cpu_thresh and not self._cpu_alerted:
             self._cpu_alerted = True
             if self._tray:
@@ -693,12 +711,17 @@ class Monitor:
             sent = list(self._net_sent_hist)
             recv = list(self._net_recv_hist)
             if not sent and not recv: return
+            # La escala vertical es dinámica: el pico actual ocupa el 100 % del alto.
+            # El mínimo garantizado de 1 evita división por cero cuando no hay tráfico.
             peak = max(max(sent, default=0), max(recv, default=0), 1)
             PX, PY = 2, 4; gh = h - PY*2
             for frac in (0.25, 0.5, 0.75):
                 gy = int(h - PY - frac*gh)
                 c.create_line(PX, gy, w-PX, gy, fill="#2d2d2d", dash=(2,4))
             def _pts(s):
+                # Convierte la serie temporal en coordenadas de píxel para create_line.
+                # Los puntos se distribuyen uniformemente en el eje X; el eje Y
+                # está invertido (Y=0 es la parte superior del canvas en Tkinter).
                 n = len(s)
                 if n < 2: return []
                 r = []
@@ -898,6 +921,12 @@ class Monitor:
                         f"{str(r['port']):<{_C['port']}}"
                         f"{r['state']:<{_C['state']}}"
                         f"{r['mb']:.2f}")
+                # Lógica de color por prioridad:
+                # 1. Puerto malicioso pero proceso en whitelist → naranja (port_bad)
+                # 2. Proceso sospechoso con VT confirmando limpio → verde (vt_safe)
+                #    Solo se aplica si VT ya respondió y no hubo error
+                # 3. Resto de sospechosos → rojo (suspicious)
+                # 4. Conexiones normales → blanco (safe)
                 if r["port_bad"] and not r["suspicious"]:
                     tag = "port_bad"
                 elif r["suspicious"]:
@@ -1505,6 +1534,12 @@ class Monitor:
         self.root.after(VT_INTERVAL, self._tick_vt)
 
     def _vt_drain(self):
+        # Limitador de cuota: la API gratuita de VT permite 500 consultas/día.
+        # El programa se autolimita a 75 para no agotar la cuota aunque la app
+        # corra continuamente. El contador se resetea cada 86 400 s (24 h)
+        # usando monotonic() para que no se vea afectado por cambios de hora.
+        # Solo se procesa una petición por tick de VT_INTERVAL (15 s), lo que
+        # también actúa como rate-limiter frente a la API (máx. 4/min).
         api_key = self._cfg.get("vt_api_key","").strip()
         if not api_key or not self._vt_queue: return
         if time.monotonic()-self._vt_day_t > 86_400:
