@@ -44,7 +44,7 @@ Monitor de seguridad en tiempo real para Windows. Detecta conexiones sospechosas
 
 - Windows 10 / 11
 - Python 3.10 o superior
-- Ejecutar como **Administrador** para acceder a conexiones de red, firewall y Event Log
+- **No requiere Administrador** — funciona con privilegios de usuario estándar
 
 ### Dependencias
 
@@ -59,8 +59,8 @@ pip install psutil
 ## Instalación
 
 ```bash
-git clone https://github.com/tu-usuario/system-monitor.git
-cd system-monitor
+git clone https://github.com/Javi2597/monitor24hs.git
+cd monitor24hs
 pip install psutil
 copy config.example.json config.json
 python monitor.py
@@ -91,14 +91,50 @@ Edita `config.json` (creado a partir de `config.example.json`):
 | `disk_thresh` | Porcentaje de disco a partir del cual se dispara una alerta |
 
 > `config.json` está excluido del repositorio para proteger tu API key. Nunca lo subas.
+> Al guardar la configuración, el programa restringe automáticamente los permisos del archivo al usuario actual mediante `icacls`.
+
+---
+
+## Arquitectura
+
+El código está separado en módulos especializados:
+
+| Módulo | Responsabilidad |
+|---|---|
+| `monitor.py` | UI principal, orquestación y bucle de eventos Tkinter |
+| `security.py` | Escaneos bloqueantes: temperatura, GPU, registro, DLLs, servicios, firmas |
+| `network.py` | I/O de red: conexiones TCP, resolución de IPs, consultas VirusTotal |
+| `db.py` | Persistencia SQLite: historial de conexiones y métricas de 24 h |
+| `utils.py` | Constantes, helpers puros y lectura/escritura de configuración |
+
+Todo el I/O pesado se ejecuta en un `ThreadPoolExecutor` y los resultados se despachan al hilo principal via `root.after(0, callback)`.
 
 ---
 
 ## Advertencias
 
 - El programa crea reglas de salida en el **Firewall de Windows** cuando se usa el botón "Bloquear FW". Estas reglas se pueden ver y eliminar desde el gestor de firewall integrado en la app.
-- El módulo de detección de DLL escanea los mapas de memoria de procesos activos. Requiere permisos elevados.
+- La detección de DLL injection escanea los mapas de memoria de procesos activos; puede no tener acceso a procesos de sistema sin permisos elevados.
 - El límite de la API gratuita de VirusTotal es de **500 consultas/día** (el programa aplica un límite interno de 75/día para no agotarla).
+- `sigcheck.exe` (Sysinternals) es opcional. Si está presente en `C:\Tools\` o `C:\Program Files\Sysinternals\`, se usa para verificar firmas digitales; si no, se usa `Get-AuthenticodeSignature` de PowerShell como fallback.
+
+---
+
+## Seguridad
+
+El proyecto fue sometido a una auditoría de seguridad interna. Los principales controles implementados son:
+
+| Área | Control |
+|---|---|
+| Inyección de comandos | Rutas de ejecutables pasadas por `stdin` a PowerShell, nunca interpoladas en el comando |
+| XSS en reportes HTML | Todos los valores de datos externos pasan por `html.escape()` antes de insertarse |
+| Reglas de firewall | Nombres de proceso sanitizados con regex `[^A-Za-z0-9._-]` antes de pasar a `netsh` |
+| Privilegios de inicio | Auto-inicio registrado sin `/rl HIGHEST` — nivel de usuario estándar |
+| Peticiones HTTPS | Contexto SSL explícito (`ssl.create_default_context()`) en todas las llamadas de red |
+| Concurrencia en BD | `threading.Lock` + `PRAGMA journal_mode=WAL` en todas las operaciones SQLite |
+| API key en reposo | Permisos del archivo `config.json` restringidos al usuario actual via `icacls` |
+| Herramientas externas | `sigcheck.exe` y `nvidia-smi` resueltos desde rutas absolutas conocidas, no desde `PATH` |
+| API key en la UI | Campo de entrada con `show="*"` y botón de revelar; no se prerrellena en texto claro |
 
 ---
 
