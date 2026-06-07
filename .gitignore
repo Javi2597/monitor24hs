@@ -1,0 +1,19 @@
+# Configuración personal (contiene API keys)
+config.json
+
+# Base de datos con historial de conexiones
+monitor_history.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Reportes generados por el programa
+*.html
+*.csv
+
+# IDEs
+.vscode/
+.idea/

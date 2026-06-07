@@ -1,0 +1,7 @@
+{
+  "vt_api_key": "",
+  "whitelist": [],
+  "cpu_thresh": 90,
+  "ram_thresh": 90,
+  "disk_thresh": 92
+}
